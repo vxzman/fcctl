@@ -52,7 +52,7 @@ struct Vm {
 struct Host {
     std::string bridge = "brg27";
     std::string binary;
-    std::string config_dir = "/etc/firecracker";
+    std::string config_dir = "/etc/fcctl";
     std::string runtime_dir = "/run/firecracker";
     std::string fcctl_bin = "/usr/local/bin/fcctl";
     std::string unit_dir = "/etc/systemd/system";
@@ -1230,8 +1230,8 @@ void usage() {
            "  fcctl generate <vm|--all> [--write]\n"
            "                            print or install <name>.fc.service\n"
            "\n"
-           "VM files are Firecracker JSON (the files in /etc/firecracker).\n"
-           "The bridge and binary live in /etc/fcctl/config.json.\n";
+           "VM files are Firecracker JSON in /etc/fcctl (config.json is the host file).\n"
+           "The bridge and binary are keys in that same config.json.\n";
 }
 
 void self_test() {
@@ -1259,23 +1259,23 @@ void self_test() {
     }
     Vm debian;
     debian.name = "debian";
-    debian.file = "/etc/firecracker/debian.json";
-    debian.kernel = "/etc/firecracker/boot/vmlinux-exp";
+    debian.file = "/etc/fcctl/debian.json";
+    debian.kernel = "/etc/fcctl/boot/vmlinux-exp";
     debian.disks.push_back({"/dev/ubuntu-vg/debian.raw", false});
     debian.nics.push_back({"eth0", "0a:fc:00:00:02:00", "fc-debian"});
     Host host;
     ::setenv("FCCTL_BIN", "/usr/local/bin/fcctl", 1);
     const std::string unit = render_unit(host, debian);
     if (unit.find("SyslogIdentifier=debian.fc\n") == std::string::npos ||
-        unit.find("ExecStart=\"/usr/local/bin/fcctl\" run \"/etc/firecracker/debian.json\"\n") ==
+        unit.find("ExecStart=\"/usr/local/bin/fcctl\" run \"/etc/fcctl/debian.json\"\n") ==
             std::string::npos ||
         unit.find("Requires=dev-ubuntu\\x2dvg-debian.raw.device\n") == std::string::npos ||
-        unit.find("RequiresMountsFor=/etc/firecracker/boot/vmlinux-exp\n") == std::string::npos) {
+        unit.find("RequiresMountsFor=/etc/fcctl/boot/vmlinux-exp\n") == std::string::npos) {
         fail("unit text mismatch:\n" + unit);
     }
     Vm rocky = debian;
     rocky.name = "rocky";
-    rocky.file = "/etc/firecracker/rocky.json";
+    rocky.file = "/etc/fcctl/rocky.json";
     rocky.nics[0].host_dev = "fc-rocky";
     Report bad = check_vms({debian, rocky});
     bool disk = false;

@@ -1,6 +1,6 @@
 {
   "boot-source": {
-    "kernel_image_path": "/etc/firecracker/boot/vmlinux-exp",
+    "kernel_image_path": "/etc/fcctl/boot/vmlinux-exp",
     "boot_args": "console=ttyS0 root=/dev/vda rw rootwait reboot=k panic=1 pci=off nomodules"
   },
   "drives": [
