@@ -1,0 +1,10 @@
+{
+  "bridge": "brg27",
+  "binary": "",
+  "config_dir": "/etc/firecracker",
+  "runtime_dir": "/run/firecracker",
+  "fcctl_bin": "/usr/local/bin/fcctl",
+  "unit_dir": "/etc/systemd/system",
+  "stop_timeout_secs": 45,
+  "timeout_stop_sec": 90
+}

@@ -1,0 +1,34 @@
+{
+  "boot-source": {
+    "kernel_image_path": "/etc/firecracker/boot/vmlinux-exp",
+    "boot_args": "console=ttyS0 root=/dev/vda rw rootwait reboot=k panic=1 pci=off nomodules"
+  },
+  "drives": [
+    {
+      "drive_id": "rootfs",
+      "path_on_host": "/dev/ubuntu-vg/debian.raw",
+      "is_root_device": true,
+      "is_read_only": false,
+      "cache_type": "Writeback",
+      "io_engine": "Async"
+    }
+  ],
+  "machine-config": {
+    "vcpu_count": 2,
+    "mem_size_mib": 2048,
+    "smt": false
+  },
+  "network-interfaces": [
+    {
+      "iface_id": "eth0",
+      "guest_mac": "0a:fc:00:00:02:00",
+      "host_dev_name": "fc-debian"
+    }
+  ],
+  "logger": {
+    "log_path": "/var/log/firecracker/debian.log",
+    "level": "Info",
+    "show_level": true,
+    "show_log_origin": false
+  }
+}
