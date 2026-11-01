@@ -25,6 +25,15 @@
 #include <utility>
 #include <vector>
 
+// systemd Restart=on-failure must not spin when the API socket is already taken.
+constexpr int kExitAlreadyRunning = 69;
+
+struct ExitCode : std::runtime_error {
+    int code;
+    ExitCode(int exit_code, const std::string& message)
+        : std::runtime_error(message), code(exit_code) {}
+};
+
 namespace {
 
 constexpr const char* kVersion = "0.1.0";
@@ -74,6 +83,10 @@ void warn(const std::string& message) {
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
+}
+
+[[noreturn]] void fail_code(int code, const std::string& message) {
+    throw ExitCode(code, message);
 }
 
 bool is_dir(const std::string& path) {
@@ -665,6 +678,7 @@ std::string render_unit(const Host& host, const Vm& vm) {
     unit << "ExecStopPost=-\"" << bin << "\" clean \"" << src << "\"\n";
     unit << "TimeoutStopSec=" << unit_stop_timeout(host) << "\n";
     unit << "Restart=on-failure\n";
+    unit << "RestartPreventExitStatus=" << kExitAlreadyRunning << "\n";
     unit << "RestartSec=2\n";
     unit << "LimitNOFILE=65536\n";
     unit << "StandardInput=null\n";
@@ -1035,7 +1049,7 @@ void cmd_run(const Host& host, Vm vm) {
     const std::string binary = find_firecracker(host);
     const std::string sock = api_socket(host, vm);
     if (api_alive(sock)) {
-        fail("VM '" + vm.name + "' is already running");
+        fail_code(kExitAlreadyRunning, "VM '" + vm.name + "' is already running");
     }
     ensure_paths(vm);
     if (::mkdir(host.runtime_dir.c_str(), 0755) != 0 && errno != EEXIST) {
@@ -1270,7 +1284,8 @@ void self_test() {
         unit.find("ExecStart=\"/usr/local/bin/fcctl\" run \"/etc/fcctl/debian.json\"\n") ==
             std::string::npos ||
         unit.find("Requires=dev-ubuntu\\x2dvg-debian.raw.device\n") == std::string::npos ||
-        unit.find("RequiresMountsFor=/etc/fcctl/boot/vmlinux-exp\n") == std::string::npos) {
+        unit.find("RequiresMountsFor=/etc/fcctl/boot/vmlinux-exp\n") == std::string::npos ||
+        unit.find("RestartPreventExitStatus=69\n") == std::string::npos) {
         fail("unit text mismatch:\n" + unit);
     }
     Vm rocky = debian;
@@ -1409,6 +1424,9 @@ int main(int argc, char** argv) {
             return cmd_generator(host, argv[2]);
         }
         fail("unknown command '" + cmd + "'");
+    } catch (const ExitCode& err) {
+        std::cerr << "fcctl: " << err.what() << "\n";
+        return err.code;
     } catch (const std::exception& err) {
         std::cerr << "fcctl: " << err.what() << "\n";
         return 1;

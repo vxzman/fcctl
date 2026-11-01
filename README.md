@@ -10,7 +10,7 @@ firecracker --api-sock /run/firecracker/<name>.sock --config-file /etc/fcctl/<na
 
 正在跑的是 v1.16.1，`debian` 和 `rocky` 各一个。`fcctl` 做三件事：启动前准备这块 tap，关机后删掉它和 API socket，以及在一组 JSON 之间检查磁盘和 MAC。生成的单元名是 `<name>.fc.service`，例如 `debian.fc.service`。
 
-不要让 `debian.fc.service` 和正在运行的 `firecracker@debian.service` 同时启动。它们用同一块盘、同一个 tap、同一个 API socket。
+不要让 `debian.fc.service` 和正在运行的 `firecracker@debian.service` 同时启动。它们用同一块盘、同一个 tap、同一个 API socket。socket 已被占用时 `fcctl run` 以 69 退出，单元里的 `RestartPreventExitStatus=69` 避免 `Restart=on-failure` 反复拉起。
 
 ## 配置
 
@@ -50,6 +50,7 @@ ExecStop="/usr/local/bin/fcctl" stop "/etc/fcctl/debian.json"
 ExecStopPost=-"/usr/local/bin/fcctl" clean "/etc/fcctl/debian.json"
 TimeoutStopSec=90
 Restart=on-failure
+RestartPreventExitStatus=69
 RestartSec=2
 ```
 

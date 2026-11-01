@@ -37,6 +37,7 @@ echo "$unit" | grep -q "SyslogIdentifier=debian.fc"
 echo "$unit" | grep -q 'ExecStart="/usr/local/bin/fcctl" run "'
 echo "$unit" | grep -q 'Requires=dev-ubuntu\\x2dvg-debian.raw.device'
 echo "$unit" | grep -q "ExecStopPost="
+echo "$unit" | grep -q "RestartPreventExitStatus=69"
 
 cat > "$TMP/host.json" << EOF
 {
