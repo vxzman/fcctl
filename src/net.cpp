@@ -26,8 +26,19 @@ constexpr std::uint16_t kNlmFAck = 0x04;
 constexpr std::uint16_t kNlmsgError = 2;
 constexpr std::size_t kNlmsgHdrlen = 16;
 constexpr std::uint16_t kIflaIfname = 3;
+constexpr std::uint16_t kIflaLink = 5;
 constexpr std::uint16_t kIflaMaster = 10;
+constexpr std::uint16_t kIflaLinkinfo = 18;
+constexpr std::uint16_t kIflaInfoKind = 1;
+constexpr std::uint16_t kIflaInfoData = 2;
+constexpr std::uint16_t kIflaMacvlanMode = 1;
+constexpr std::uint16_t kNlmFCreate = 0x400;
+constexpr std::uint16_t kNlmFExcl = 0x200;
 constexpr std::uint32_t kIfFlagUp = 1;
+constexpr std::uint32_t kMacvlanPrivate = 1;
+constexpr std::uint32_t kMacvlanVepa = 2;
+constexpr std::uint32_t kMacvlanBridge = 4;
+constexpr std::uint32_t kMacvlanPassthru = 8;
 
 std::uint32_t next_seq() {
     static std::uint32_t seq = 1;
@@ -96,11 +107,34 @@ public:
         buf_.resize(at + 4 + len, 0);
         put16(buf_, at, static_cast<std::uint16_t>(4 + len));
         put16(buf_, at + 2, kind);
-        std::memcpy(buf_.data() + at + 4, data, len);
+        if (len > 0 && data != nullptr) {
+            std::memcpy(buf_.data() + at + 4, data, len);
+        }
         align();
     }
 
+    void begin_attr(std::uint16_t kind) {
+        align();
+        const std::size_t at = buf_.size();
+        buf_.resize(at + 4, 0);
+        put16(buf_, at + 2, kind);
+        nest_.push_back(at);
+    }
+
+    void end_attr() {
+        if (nest_.empty()) {
+            throw std::runtime_error("netlink nested attribute underflow");
+        }
+        align();
+        const std::size_t at = nest_.back();
+        nest_.pop_back();
+        put16(buf_, at, static_cast<std::uint16_t>(buf_.size() - at));
+    }
+
     std::vector<std::uint8_t> finish() {
+        if (!nest_.empty()) {
+            throw std::runtime_error("netlink nested attribute still open");
+        }
         align();
         put32(buf_, 0, static_cast<std::uint32_t>(buf_.size()));
         return buf_;
@@ -108,6 +142,7 @@ public:
 
 private:
     std::vector<std::uint8_t> buf_;
+    std::vector<std::size_t> nest_;
 };
 
 std::vector<std::uint8_t> c_string(const std::string& text) {
@@ -254,6 +289,60 @@ void create_tap(const std::string& name) {
     if (::ioctl(fd, TUNSETPERSIST, 1) < 0) {
         io_error("failed to persist tap device '" + name + "'");
     }
+}
+
+namespace {
+
+std::uint32_t macvlan_mode_value(const std::string& mode) {
+    const std::string& value = mode.empty() ? "bridge" : mode;
+    if (value == "private") {
+        return kMacvlanPrivate;
+    }
+    if (value == "vepa") {
+        return kMacvlanVepa;
+    }
+    if (value == "bridge") {
+        return kMacvlanBridge;
+    }
+    if (value == "passthru") {
+        return kMacvlanPassthru;
+    }
+    throw std::runtime_error("unknown macvlan mode '" + mode + "'");
+}
+
+void create_mac_device(const std::string& name, const std::string& master, const std::string& kind,
+                       const std::string& mode) {
+    const int parent = ifindex_of(master);
+    const std::uint32_t mode_value = macvlan_mode_value(mode);
+    Msg msg(kRtmNewlink, kNlmFRequest | kNlmFAck | kNlmFCreate | kNlmFExcl, next_seq());
+    msg.ifinfo(0, 0, 0);
+    const std::vector<std::uint8_t> ifname = c_string(name);
+    msg.attr(kIflaIfname, ifname.data(), ifname.size());
+    const std::int32_t parent_index = parent;
+    msg.attr(kIflaLink, &parent_index, sizeof(parent_index));
+    msg.begin_attr(kIflaLinkinfo);
+    const std::vector<std::uint8_t> kind_bytes = c_string(kind);
+    msg.attr(kIflaInfoKind, kind_bytes.data(), kind_bytes.size());
+    msg.begin_attr(kIflaInfoData);
+    msg.attr(kIflaMacvlanMode, &mode_value, sizeof(mode_value));
+    msg.end_attr();
+    msg.end_attr();
+    try {
+        Netlink().talk(msg.finish());
+    } catch (const std::runtime_error& err) {
+        throw std::runtime_error("failed to create " + kind + " device '" + name + "' on '" +
+                                 master + "': " + err.what());
+    }
+}
+
+}  // namespace
+
+void create_macvlan(const std::string& name, const std::string& master, const std::string& mode) {
+    create_mac_device(name, master, "macvlan", mode);
+}
+
+void create_macvtap(const std::string& name, const std::string& master, const std::string& mode) {
+    create_mac_device(name, master, "macvtap", mode);
 }
 
 void set_master(const std::string& name, const std::string& bridge) {

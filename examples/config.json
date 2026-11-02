@@ -1,7 +1,9 @@
 {
-  "bridge": "brg27",
-  "binary": "",
   "config_dir": "/etc/fcctl",
+  "network": [
+    { "type": "bridge", "master": "brg27" }
+  ],
+  "binary": "",
   "runtime_dir": "/run/firecracker",
   "fcctl_bin": "/usr/local/bin/fcctl",
   "unit_dir": "/etc/systemd/system",

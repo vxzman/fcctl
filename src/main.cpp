@@ -36,7 +36,7 @@ struct ExitCode : std::runtime_error {
 
 namespace {
 
-constexpr const char* kVersion = "0.1.0";
+constexpr const char* kVersion = "0.2.0";
 
 struct Disk {
     std::string path;
@@ -58,8 +58,16 @@ struct Vm {
     std::vector<Nic> nics;
 };
 
+struct NetSpec {
+    std::string name;
+    std::string type;
+    std::string master;
+    std::string mode;
+};
+
 struct Host {
-    std::string bridge = "brg27";
+    std::string config_path = "/etc/fcctl/config.json";
+    std::vector<NetSpec> network;
     std::string binary;
     std::string config_dir = "/etc/fcctl";
     std::string runtime_dir = "/run/firecracker";
@@ -203,6 +211,85 @@ std::string env_or(const char* key, const std::string& fallback) {
     return fallback;
 }
 
+bool valid_net_type(const std::string& type) {
+    return type == "tap" || type == "bridge" || type == "macvtap" || type == "macvlan";
+}
+
+bool valid_macvlan_mode(const std::string& mode) {
+    return mode == "bridge" || mode == "vepa" || mode == "private" || mode == "passthru";
+}
+
+bool needs_master(const std::string& type) { return type != "tap"; }
+
+void validate_net_spec(const NetSpec& spec, const std::string& path, std::size_t index) {
+    const std::string where = path + ": network[" + std::to_string(index) + "]";
+    if (!valid_net_type(spec.type)) {
+        fail(where + ": type must be tap, bridge, macvtap, or macvlan");
+    }
+    if (!spec.name.empty() && !valid_ifname(spec.name)) {
+        fail(where + ": name '" + spec.name + "' is not a usable interface name");
+    }
+    if (needs_master(spec.type)) {
+        if (spec.master.empty() || spec.master.find('/') != std::string::npos ||
+            !valid_ifname(spec.master)) {
+            fail(where + ": master must be an interface name");
+        }
+    } else if (!spec.master.empty()) {
+        fail(where + ": tap does not take master");
+    }
+    if (spec.type == "macvlan" || spec.type == "macvtap") {
+        if (!valid_macvlan_mode(spec.mode)) {
+            fail(where + ": mode must be bridge, vepa, private, or passthru");
+        }
+    } else if (!spec.mode.empty()) {
+        fail(where + ": mode is only valid for macvlan and macvtap");
+    }
+}
+
+NetSpec parse_net_spec(const Json& item, const std::string& path, std::size_t index) {
+    const std::string where = path + ": network[" + std::to_string(index) + "]";
+    if (item.type != Json::Type::Object) {
+        fail(where + " is not an object");
+    }
+    for (const auto& field : item.o) {
+        const std::string& key = field.first;
+        if (key != "type" && key != "master" && key != "name" && key != "mode") {
+            fail(where + ": unknown key \"" + key + "\"");
+        }
+        if (field.second.type != Json::Type::String) {
+            fail(where + ": " + key + " must be a string");
+        }
+    }
+    NetSpec spec;
+    spec.type = item.str("type");
+    spec.master = item.str("master");
+    spec.name = item.str("name");
+    spec.mode = item.str("mode");
+    if (spec.type.empty()) {
+        fail(where + " is missing type");
+    }
+    if ((spec.type == "macvlan" || spec.type == "macvtap") && spec.mode.empty()) {
+        spec.mode = "bridge";
+    }
+    validate_net_spec(spec, path, index);
+    return spec;
+}
+
+void check_network_unique(const std::vector<NetSpec>& network, const std::string& path) {
+    bool have_default = false;
+    std::set<std::string> names;
+    for (const NetSpec& spec : network) {
+        if (spec.name.empty()) {
+            if (have_default) {
+                fail(path + ": only one default network entry is allowed");
+            }
+            have_default = true;
+        } else if (!names.insert(spec.name).second) {
+            fail(path + ": duplicate network name '" + spec.name + "'");
+        }
+    }
+}
+
 void apply_host_json(Host& host, const Json& root, const std::string& path) {
     if (root.type != Json::Type::Object) {
         fail(path + " must be a JSON object");
@@ -218,12 +305,38 @@ void apply_host_json(Host& host, const Json& root, const std::string& path) {
             if (item.second.type != Json::Type::Number || !item.second.is_int || item.second.i <= 0) {
                 fail(path + ": " + key + " must be a positive integer");
             }
+        } else if (key == "network") {
+            if (item.second.type != Json::Type::Array) {
+                fail(path + ": network must be an array");
+            }
         } else {
             fail(path + ": unknown key \"" + key + "\"");
         }
     }
-    if (const Json* value = root.find("bridge")) {
-        host.bridge = value->s;
+    std::string bridge;
+    const bool had_bridge = root.find("bridge") != nullptr;
+    if (had_bridge) {
+        bridge = root.find("bridge")->s;
+        if (bridge.empty() || bridge.find('/') != std::string::npos || !valid_ifname(bridge)) {
+            fail(path + ": bridge must be an interface name");
+        }
+    }
+    const bool had_network = root.find("network") != nullptr;
+    if (had_network) {
+        const Json* list = root.find("network");
+        for (std::size_t i = 0; i < list->a.size(); ++i) {
+            host.network.push_back(parse_net_spec(list->a[i], path, i));
+        }
+        check_network_unique(host.network, path);
+    }
+    if (had_network && had_bridge) {
+        fail(path + ": set network or bridge, not both");
+    }
+    if (!had_network) {
+        NetSpec spec;
+        spec.type = "bridge";
+        spec.master = had_bridge ? bridge : "brg27";
+        host.network.push_back(std::move(spec));
     }
     if (const Json* value = root.find("binary")) {
         host.binary = value->s;
@@ -246,28 +359,78 @@ void apply_host_json(Host& host, const Json& root, const std::string& path) {
     if (const Json* value = root.find("timeout_stop_sec")) {
         host.timeout_stop_sec = static_cast<int>(value->i);
     }
-    if (host.bridge.empty() || host.bridge.find('/') != std::string::npos) {
-        fail("bridge must be an interface name");
-    }
 }
 
-Host load_host() {
-    Host host;
-    std::string path = "/etc/fcctl/config.json";
-    const bool explicit_config = std::getenv("FCCTL_CONFIG") != nullptr;
-    if (explicit_config) {
-        path = std::getenv("FCCTL_CONFIG");
+void apply_bridge_env(Host& host) {
+    const char* value = std::getenv("FCCTL_BRIDGE");
+    if (value == nullptr || *value == '\0') {
+        return;
     }
-    if (is_file(path)) {
-        apply_host_json(host, parse_json(read_file(path)), path);
+    NetSpec* unnamed = nullptr;
+    for (NetSpec& spec : host.network) {
+        if (spec.name.empty()) {
+            unnamed = &spec;
+            break;
+        }
+    }
+    if (unnamed == nullptr) {
+        fail("FCCTL_BRIDGE requires a default network entry");
+    }
+    if (unnamed->type != "bridge") {
+        fail("FCCTL_BRIDGE can only override a default bridge entry");
+    }
+    unnamed->master = value;
+}
+
+Host load_host(const std::string& cli_config) {
+    Host host;
+    bool explicit_config = false;
+    if (!cli_config.empty()) {
+        host.config_path = cli_config;
+        explicit_config = true;
+    } else if (const char* env = std::getenv("FCCTL_CONFIG")) {
+        host.config_path = env;
+        explicit_config = true;
+    }
+    if (is_file(host.config_path)) {
+        apply_host_json(host, parse_json(read_file(host.config_path)), host.config_path);
     } else if (explicit_config) {
-        fail("global config '" + path + "' does not exist");
+        fail("global config '" + host.config_path + "' does not exist");
+    } else {
+        NetSpec spec;
+        spec.type = "bridge";
+        spec.master = "brg27";
+        host.network.push_back(std::move(spec));
     }
     host.config_dir = env_or("FCCTL_CONFIG_DIR", host.config_dir);
-    host.bridge = env_or("FCCTL_BRIDGE", host.bridge);
+    apply_bridge_env(host);
     host.runtime_dir = env_or("FCCTL_RUNTIME", host.runtime_dir);
     host.binary = env_or("FCCTL_FIRECRACKER", host.binary);
     return host;
+}
+
+NetSpec spec_for_nic(const Host& host, const std::string& ifname) {
+    if (host.network.empty()) {
+        NetSpec tap;
+        tap.type = "tap";
+        return tap;
+    }
+    const NetSpec* named = nullptr;
+    const NetSpec* unnamed = nullptr;
+    for (const NetSpec& spec : host.network) {
+        if (spec.name == ifname) {
+            named = &spec;
+        } else if (spec.name.empty()) {
+            unnamed = &spec;
+        }
+    }
+    if (named != nullptr) {
+        return *named;
+    }
+    if (unnamed != nullptr) {
+        return *unnamed;
+    }
+    fail("no network entry matches host_dev_name '" + ifname + "'");
 }
 
 bool looks_like_vm(const Json& root) {
@@ -560,8 +723,12 @@ Report scan(const Host& host, const std::vector<std::string>& extra) {
     report.warnings.insert(report.warnings.begin(), load_errors.warnings.begin(),
                            load_errors.warnings.end());
     report.bad_vms.insert(load_errors.bad_vms.begin(), load_errors.bad_vms.end());
-    if (!host.bridge.empty() && !iface_exists(host.bridge)) {
-        report.warnings.push_back("bridge '" + host.bridge + "' does not exist yet");
+    std::set<std::string> masters;
+    for (const NetSpec& spec : host.network) {
+        if (!spec.master.empty() && masters.insert(spec.master).second &&
+            !iface_exists(spec.master)) {
+            report.warnings.push_back("master '" + spec.master + "' does not exist yet");
+        }
     }
     return report;
 }
@@ -673,9 +840,12 @@ std::string render_unit(const Host& host, const Vm& vm) {
     unit << "\n[Service]\n";
     unit << "Type=simple\n";
     unit << "SyslogIdentifier=" << vm.name << ".fc\n";
-    unit << "ExecStart=\"" << bin << "\" run \"" << src << "\"\n";
-    unit << "ExecStop=\"" << bin << "\" stop \"" << src << "\"\n";
-    unit << "ExecStopPost=-\"" << bin << "\" clean \"" << src << "\"\n";
+    unit << "ExecStart=\"" << bin << "\" --config \"" << host.config_path << "\" --run \"" << src
+         << "\"\n";
+    unit << "ExecStop=\"" << bin << "\" --config \"" << host.config_path << "\" --stop \"" << src
+         << "\"\n";
+    unit << "ExecStopPost=-\"" << bin << "\" --config \"" << host.config_path << "\" --clean \""
+         << src << "\"\n";
     unit << "TimeoutStopSec=" << unit_stop_timeout(host) << "\n";
     unit << "Restart=on-failure\n";
     unit << "RestartPreventExitStatus=" << kExitAlreadyRunning << "\n";
@@ -911,18 +1081,34 @@ void wait_until_down(const std::string& path, int timeout_secs) {
     }
 }
 
-std::vector<std::string> prepare_nics(const Vm& vm, const std::string& bridge) {
+std::vector<std::string> prepare_nics(const Host& host, const Vm& vm) {
     std::vector<std::string> created;
     try {
         for (const Nic& nic : vm.nics) {
+            const NetSpec spec = spec_for_nic(host, nic.host_dev);
             const bool existed = iface_exists(nic.host_dev);
             if (!existed) {
-                create_tap(nic.host_dev);
+                if (spec.type == "macvlan") {
+                    create_macvlan(nic.host_dev, spec.master, spec.mode);
+                } else if (spec.type == "macvtap") {
+                    create_macvtap(nic.host_dev, spec.master, spec.mode);
+                } else {
+                    create_tap(nic.host_dev);
+                }
                 created.push_back(nic.host_dev);
             }
-            set_master(nic.host_dev, bridge);
+            if (spec.type == "bridge") {
+                set_master(nic.host_dev, spec.master);
+            }
             set_up(nic.host_dev);
-            info("prepared tap " + nic.host_dev + " on " + bridge);
+            std::string line = "prepared " + nic.host_dev + " type=" + spec.type;
+            if (!spec.master.empty()) {
+                line += " master=" + spec.master;
+            }
+            if (!spec.mode.empty()) {
+                line += " mode=" + spec.mode;
+            }
+            info(line);
         }
     } catch (...) {
         for (const std::string& name : created) {
@@ -942,7 +1128,7 @@ void remove_runtime(const Host& host, const Vm& vm) {
         try {
             if (iface_exists(nic.host_dev)) {
                 delete_link(nic.host_dev);
-                info("removed tap " + nic.host_dev);
+                info("removed " + nic.host_dev);
             }
         } catch (const std::exception& err) {
             warn(err.what());
@@ -1017,7 +1203,7 @@ void on_signal(int) {
 }
 
 void cmd_prepare(const Host& host, const Vm& vm) {
-    prepare_nics(vm, host.bridge);
+    prepare_nics(host, vm);
 }
 
 void cmd_clean(const Host& host, const Vm& vm) {
@@ -1055,7 +1241,7 @@ void cmd_run(const Host& host, Vm vm) {
     if (::mkdir(host.runtime_dir.c_str(), 0755) != 0 && errno != EEXIST) {
         fail("cannot create '" + host.runtime_dir + "': " + std::strerror(errno));
     }
-    prepare_nics(vm, host.bridge);
+    prepare_nics(host, vm);
     struct CleanGuard {
         const Host* host = nullptr;
         const Vm* vm = nullptr;
@@ -1236,16 +1422,127 @@ void usage() {
         << "fcctl " << kVersion
         << " — Firecracker controller\n"
            "\n"
-           "  fcctl run <vm.json>       prepare taps, run Firecracker in the foreground\n"
-           "  fcctl stop <vm.json>      SendCtrlAltDel and wait\n"
-           "  fcctl clean <vm.json>     delete taps and the API socket\n"
-           "  fcctl prepare <vm.json>   create taps and attach them to the bridge\n"
-           "  fcctl check [vm.json]     disk, MAC, and tap checks\n"
-           "  fcctl generate <vm|--all> [--write]\n"
-           "                            print or install <name>.fc.service\n"
+           "  fcctl [--config|-c <host.json>] --run <vm.json>\n"
+           "  fcctl [--config|-c <host.json>] --stop <vm.json>\n"
+           "  fcctl [--config|-c <host.json>] --clean <vm.json>\n"
+           "  fcctl [--config|-c <host.json>] --prepare <vm.json>\n"
+           "  fcctl [--config|-c <host.json>] --check [vm.json]\n"
+           "  fcctl [--config|-c <host.json>] --generate <vm|--all> [--write]\n"
            "\n"
            "VM files are Firecracker JSON in /etc/fcctl (config.json is the host file).\n"
-           "The bridge and binary are keys in that same config.json.\n";
+           "Host network[] creates tap/bridge/macvtap/macvlan devices; no addresses or NAT.\n"
+           "Subcommands (run, stop, clean, prepare, check, generate) are aliases for the flags.\n";
+}
+
+std::string action_token(const std::string& arg) {
+    if (arg == "--run" || arg == "run") {
+        return "run";
+    }
+    if (arg == "--stop" || arg == "stop") {
+        return "stop";
+    }
+    if (arg == "--clean" || arg == "clean") {
+        return "clean";
+    }
+    if (arg == "--prepare" || arg == "prepare") {
+        return "prepare";
+    }
+    if (arg == "--check" || arg == "check") {
+        return "check";
+    }
+    if (arg == "--generate" || arg == "generate") {
+        return "generate";
+    }
+    if (arg == "systemd-generator") {
+        return "systemd-generator";
+    }
+    return {};
+}
+
+struct Cli {
+    std::string config;
+    std::string action;
+    std::string target;
+    bool all = false;
+    bool write = false;
+};
+
+void set_action(Cli& cli, const std::string& action) {
+    if (!cli.action.empty() && cli.action != action) {
+        fail("conflicting actions '" + cli.action + "' and '" + action + "'");
+    }
+    cli.action = action;
+}
+
+Cli parse_cli(int argc, char** argv) {
+    Cli cli;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help" || arg == "help") {
+            set_action(cli, "help");
+            continue;
+        }
+        if (arg == "--version" || arg == "version") {
+            set_action(cli, "version");
+            continue;
+        }
+        if (arg == "self-test") {
+            set_action(cli, "self-test");
+            continue;
+        }
+        if (arg == "--all") {
+            cli.all = true;
+            continue;
+        }
+        if (arg == "--write") {
+            cli.write = true;
+            continue;
+        }
+        if (arg == "--config" || arg == "-c") {
+            if (i + 1 >= argc) {
+                fail(arg + " needs a path");
+            }
+            cli.config = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--config=", 0) == 0) {
+            cli.config = arg.substr(9);
+            if (cli.config.empty()) {
+                fail("--config needs a path");
+            }
+            continue;
+        }
+        const std::string action = action_token(arg);
+        if (!action.empty()) {
+            set_action(cli, action);
+            continue;
+        }
+        if (!arg.empty() && arg[0] == '-') {
+            fail("unknown option '" + arg + "'");
+        }
+        if (!cli.target.empty()) {
+            fail("unexpected argument '" + arg + "'");
+        }
+        cli.target = arg;
+    }
+    return cli;
+}
+
+Host host_from_text(const std::string& text) {
+    Host host;
+    apply_host_json(host, parse_json(text), "test.json");
+    return host;
+}
+
+void expect_host_fail(const std::string& text, const std::string& needle) {
+    try {
+        host_from_text(text);
+        fail("expected host JSON to fail: " + text);
+    } catch (const std::runtime_error& err) {
+        if (std::string(err.what()).find(needle) == std::string::npos) {
+            fail("wrong error '" + std::string(err.what()) + "', expected '" + needle + "'");
+        }
+    }
 }
 
 void self_test() {
@@ -1281,13 +1578,52 @@ void self_test() {
     ::setenv("FCCTL_BIN", "/usr/local/bin/fcctl", 1);
     const std::string unit = render_unit(host, debian);
     if (unit.find("SyslogIdentifier=debian.fc\n") == std::string::npos ||
-        unit.find("ExecStart=\"/usr/local/bin/fcctl\" run \"/etc/fcctl/debian.json\"\n") ==
-            std::string::npos ||
+        unit.find("ExecStart=\"/usr/local/bin/fcctl\" --config \"/etc/fcctl/config.json\" "
+                  "--run \"/etc/fcctl/debian.json\"\n") == std::string::npos ||
+        unit.find("ExecStop=\"/usr/local/bin/fcctl\" --config \"/etc/fcctl/config.json\" "
+                  "--stop \"/etc/fcctl/debian.json\"\n") == std::string::npos ||
+        unit.find("ExecStopPost=-\"/usr/local/bin/fcctl\" --config \"/etc/fcctl/config.json\" "
+                  "--clean \"/etc/fcctl/debian.json\"\n") == std::string::npos ||
         unit.find("Requires=dev-ubuntu\\x2dvg-debian.raw.device\n") == std::string::npos ||
         unit.find("RequiresMountsFor=/etc/fcctl/boot/vmlinux-exp\n") == std::string::npos ||
         unit.find("RestartPreventExitStatus=69\n") == std::string::npos) {
         fail("unit text mismatch:\n" + unit);
     }
+    const Host bridged = host_from_text(R"({
+        "network": [{ "type": "bridge", "master": "brg27" }]
+    })");
+    if (bridged.network.size() != 1 || bridged.network[0].type != "bridge" ||
+        bridged.network[0].master != "brg27" || !bridged.network[0].name.empty()) {
+        fail("failed to parse network[{type:bridge, master:brg27}]");
+    }
+    const Host legacy = host_from_text(R"({"bridge": "br0"})");
+    if (legacy.network.size() != 1 || legacy.network[0].type != "bridge" ||
+        legacy.network[0].master != "br0") {
+        fail("legacy bridge key was not synthesized");
+    }
+    const Host mixed = host_from_text(R"({
+        "network": [
+            { "type": "tap" },
+            { "type": "macvlan", "master": "eth0", "name": "fc-debian" }
+        ]
+    })");
+    if (spec_for_nic(mixed, "fc-debian").type != "macvlan" ||
+        spec_for_nic(mixed, "fc-other").type != "tap") {
+        fail("network name matching is wrong");
+    }
+    const Host empty_net = host_from_text(R"({"network": []})");
+    if (!empty_net.network.empty() || spec_for_nic(empty_net, "fc-debian").type != "tap") {
+        fail("empty network[] should create plain taps");
+    }
+    expect_host_fail(R"({"network": [{ "type": "tap", "master": "brg27" }]})",
+                     "tap does not take master");
+    expect_host_fail(R"({"network": [{ "type": "wire" }]})", "type must be");
+    expect_host_fail(R"({"network": [{ "type": "tap" }, { "type": "bridge", "master": "br0" }]})",
+                     "only one default network entry");
+    expect_host_fail(R"({"bridge": "br0", "network": [{ "type": "tap" }]})",
+                     "set network or bridge, not both");
+    expect_host_fail(R"({"network": [{ "type": "macvlan", "master": "eth0", "mode": "foo" }]})",
+                     "mode must be");
     Vm rocky = debian;
     rocky.name = "rocky";
     rocky.file = "/etc/fcctl/rocky.json";
@@ -1316,6 +1652,31 @@ void self_test() {
     info("self-test ok");
 }
 
+int cmd_check(const Host& host, const std::string& target) {
+    std::vector<std::string> extra;
+    if (!target.empty()) {
+        extra.push_back(target);
+    }
+    if (!extra.empty() || is_dir(host.config_dir)) {
+        const Report report = scan(host, extra);
+        print_report(report);
+        if (!report.errors.empty()) {
+            return 1;
+        }
+        info(std::to_string([&] {
+                 std::vector<Vm> vms;
+                 Report ignored;
+                 if (is_dir(host.config_dir)) {
+                     load_dir(host.config_dir, vms, ignored);
+                 }
+                 return vms.size();
+             }()) +
+             " VM config(s) checked");
+        return 0;
+    }
+    fail("VM directory '" + host.config_dir + "' does not exist");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1325,8 +1686,8 @@ int main(int argc, char** argv) {
         if (slash != std::string::npos) {
             arg0 = arg0.substr(slash + 1);
         }
-        const Host host = load_host();
         if (arg0.find("generator") != std::string::npos) {
+            const Host host = load_host("");
             if (argc < 2 || !is_dir(argv[1])) {
                 fail("generator expects the systemd output directory");
             }
@@ -1336,94 +1697,68 @@ int main(int argc, char** argv) {
             usage();
             return 1;
         }
-        const std::string cmd = argv[1];
-        if (cmd == "-h" || cmd == "--help" || cmd == "help") {
+        const Cli cli = parse_cli(argc, argv);
+        if (cli.action == "help") {
             usage();
             return 0;
         }
-        if (cmd == "version" || cmd == "--version") {
+        if (cli.action == "version") {
             std::cout << "fcctl " << kVersion << "\n";
             return 0;
         }
-        if (cmd == "self-test") {
+        if (cli.action == "self-test") {
             self_test();
             return 0;
         }
-        if (cmd == "check") {
-            std::vector<std::string> extra;
-            if (argc >= 3) {
-                extra.push_back(argv[2]);
-            }
-            if (!extra.empty() || is_dir(host.config_dir)) {
-                const Report report = scan(host, extra);
-                print_report(report);
-                if (!report.errors.empty()) {
-                    return 1;
-                }
-                info(std::to_string([&] {
-                         std::vector<Vm> vms;
-                         Report ignored;
-                         if (is_dir(host.config_dir)) {
-                             load_dir(host.config_dir, vms, ignored);
-                         }
-                         return vms.size();
-                     }()) +
-                     " VM config(s) checked");
-                return 0;
-            }
-            fail("VM directory '" + host.config_dir + "' does not exist");
+        if (cli.action.empty()) {
+            usage();
+            return 1;
         }
-        if (cmd == "generate") {
-            bool write = false;
-            bool all = false;
-            std::string target;
-            for (int i = 2; i < argc; ++i) {
-                const std::string arg = argv[i];
-                if (arg == "--write") {
-                    write = true;
-                } else if (arg == "--all") {
-                    all = true;
-                } else if (!arg.empty() && arg[0] == '-') {
-                    fail("unknown option '" + arg + "'");
-                } else if (!target.empty()) {
-                    fail("unexpected argument '" + arg + "'");
-                } else {
-                    target = arg;
-                }
-            }
-            if (all) {
-                cmd_generate_all(host, write);
+        if (cli.write && cli.action != "generate") {
+            fail("--write is only valid with --generate");
+        }
+        if (cli.all && cli.action != "generate") {
+            fail("--all is only valid with --generate");
+        }
+        const Host host = load_host(cli.config);
+        if (cli.action == "check") {
+            return cmd_check(host, cli.target);
+        }
+        if (cli.action == "generate") {
+            if (cli.all) {
+                cmd_generate_all(host, cli.write);
                 return 0;
             }
-            if (target.empty()) {
+            if (cli.target.empty()) {
                 fail("generate needs a VM json path or --all");
             }
-            cmd_generate_one(host, vm_from_arg(target, host), write);
+            cmd_generate_one(host, vm_from_arg(cli.target, host), cli.write);
             return 0;
         }
-        if (cmd == "run" || cmd == "stop" || cmd == "clean" || cmd == "prepare") {
-            if (argc != 3) {
-                fail(cmd + " needs one VM json path");
+        if (cli.action == "run" || cli.action == "stop" || cli.action == "clean" ||
+            cli.action == "prepare") {
+            if (cli.target.empty()) {
+                fail(cli.action + " needs one VM json path");
             }
-            Vm vm = vm_from_arg(argv[2], host);
-            if (cmd == "run") {
+            Vm vm = vm_from_arg(cli.target, host);
+            if (cli.action == "run") {
                 cmd_run(host, std::move(vm));
-            } else if (cmd == "stop") {
+            } else if (cli.action == "stop") {
                 cmd_stop(host, vm);
-            } else if (cmd == "clean") {
+            } else if (cli.action == "clean") {
                 cmd_clean(host, vm);
             } else {
                 cmd_prepare(host, vm);
             }
             return 0;
         }
-        if (cmd == "systemd-generator") {
-            if (argc < 3 || !is_dir(argv[2])) {
+        if (cli.action == "systemd-generator") {
+            if (cli.target.empty() || !is_dir(cli.target)) {
                 fail("systemd-generator needs the output directory");
             }
-            return cmd_generator(host, argv[2]);
+            return cmd_generator(host, cli.target);
         }
-        fail("unknown command '" + cmd + "'");
+        fail("unknown command '" + cli.action + "'");
     } catch (const ExitCode& err) {
         std::cerr << "fcctl: " << err.what() << "\n";
         return err.code;
