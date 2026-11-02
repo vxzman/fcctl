@@ -2,15 +2,11 @@
 
 `fcctl` 用 C++ 管理 Firecracker 虚拟机。虚拟机配置就是 Firecracker 自己的 JSON，和主机设置放在同一个目录 `/etc/fcctl`。`config.json` 是主机设置，其余 `*.json` 是虚拟机。程序不另做一套虚拟机格式。
 
-NAS 上现在的模板是 `firecracker@.service`：启动前用 `ip tuntap` 建 `fc-<name>`，挂到 `brg27`，再执行
+`fcctl` 做三件事：启动前按主机 `network[]` 准备网卡，关机后删掉它和 API socket，以及在一组 JSON 之间检查磁盘和 MAC。生成的单元名是 `<name>.fc.service`，例如 `debian.fc.service`。安装后把二进制链接为 systemd generator，`daemon-reload` 会为每个虚拟机 JSON 写出单元。
 
-```text
-firecracker --api-sock /run/firecracker/<name>.sock --config-file /etc/fcctl/<name>.json
-```
+不要让 `<name>.fc.service` 和旧模板 `firecracker@<name>.service` 同时启动。它们用同一块盘、同一个 tap、同一个 API socket。socket 已被占用时 `fcctl --run` 以 69 退出，单元里的 `RestartPreventExitStatus=69` 避免 `Restart=on-failure` 反复拉起。
 
-正在跑的是 v1.16.1，`debian` 和 `rocky` 各一个。`fcctl` 做三件事：启动前按主机 `network[]` 准备网卡，关机后删掉它和 API socket，以及在一组 JSON 之间检查磁盘和 MAC。生成的单元名是 `<name>.fc.service`，例如 `debian.fc.service`。
-
-不要让 `debian.fc.service` 和正在运行的 `firecracker@debian.service` 同时启动。它们用同一块盘、同一个 tap、同一个 API socket。socket 已被占用时 `fcctl --run` 以 69 退出，单元里的 `RestartPreventExitStatus=69` 避免 `Restart=on-failure` 反复拉起。
+当前 NAS（unas）上四台在跑：`debian.fc`、`rocky.fc`、`arch.fc`、`gentoo.fc`，Firecracker 为 v1.17.0。主机配置目录 `/etc/fcctl`，运行目录 `/run/firecracker`，网卡挂在桥 `brg27`。
 
 ## 配置
 
@@ -23,7 +19,8 @@ firecracker --api-sock /run/firecracker/<name>.sock --config-file /etc/fcctl/<na
   "config_dir": "/etc/fcctl",
   "network": [
     { "type": "bridge", "master": "brg27" }
-  ]
+  ],
+  "binary": "/opt/firecracker/release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64"
 }
 ```
 
@@ -84,15 +81,27 @@ RestartPreventExitStatus=69
 RestartSec=2
 ```
 
-`/dev/` 上的磁盘会写成 systemd device 依赖。串口仍是 Firecracker 的标准输入输出；单元把标准输入设为空，输出进 journal。客户机里 `reboot` 和 `poweroff` 在 Firecracker 1.16 上都是进程退出码 0，单元不会把这种退出当成失败再拉起。
+`/dev/` 上的磁盘会写成 systemd device 依赖。串口仍是 Firecracker 的标准输入输出；单元把标准输入设为空，输出进 journal。客户机里 `reboot` 和 `poweroff` 在 Firecracker 1.16 及以上都是进程退出码 0，单元不会把这种退出当成失败再拉起。
 
 安装后把 `fcctl` 链接为 `/etc/systemd/system-generators/fcctl-generator`。`systemctl daemon-reload` 会为 `/etc/fcctl/*.json` 生成单元，并跳过 `config.json`。有冲突的虚拟机会被跳过。
 
-## 编译
+## 编译与安装
 
-`make test` 用系统 g++ 编译并跑检查。`make static` 在 Alpine 容器里用 musl 静态链接，产物是 `build/fcctl`，可以直接拷到 NAS。
+`make test` 用系统 g++ 编译并跑检查。`make static` 在 Alpine 容器里用 musl 静态链接，产物是 `build/fcctl`（linux amd64），Release 里的文件名是 `fcctl-linux-amd64`。
 
 ```bash
 make test
 make static
 ```
+
+拷到主机后：
+
+```bash
+sudo install -m 755 fcctl-linux-amd64 /usr/local/bin/fcctl
+sudo mkdir -p /etc/fcctl /run/firecracker
+sudo ln -sf /usr/local/bin/fcctl /etc/systemd/system-generators/fcctl-generator
+# 已有 /etc/fcctl/config.json 时不要覆盖
+sudo systemctl daemon-reload
+```
+
+NAS unas 上提权用 `doas -n`，不用 sudo。正在跑的虚拟机要吃到新二进制和新 ExecStart，需要 `systemctl restart <name>.fc`。
