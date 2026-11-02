@@ -36,7 +36,7 @@ struct ExitCode : std::runtime_error {
 
 namespace {
 
-constexpr const char* kVersion = "0.2.0";
+constexpr const char* kVersion = "0.2.1";
 
 struct Disk {
     std::string path;
