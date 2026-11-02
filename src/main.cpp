@@ -439,6 +439,13 @@ bool looks_like_vm(const Json& root) {
             root.find("network-interfaces"));
 }
 
+bool looks_like_host(const Json& root) {
+    return root.type == Json::Type::Object && !looks_like_vm(root) &&
+           (root.find("network") || root.find("bridge") || root.find("binary") ||
+            root.find("config_dir") || root.find("runtime_dir") || root.find("fcctl_bin") ||
+            root.find("unit_dir"));
+}
+
 Vm parse_vm(const std::string& path) {
     Json root;
     try {
@@ -545,6 +552,9 @@ void load_dir(const std::string& dir, std::vector<Vm>& vms, Report& report) {
             root = parse_json(read_file(path));
         } catch (const std::exception& err) {
             report.errors.push_back(path + ": " + err.what());
+            continue;
+        }
+        if (looks_like_host(root)) {
             continue;
         }
         if (!looks_like_vm(root)) {
@@ -1422,16 +1432,17 @@ void usage() {
         << "fcctl " << kVersion
         << " — Firecracker controller\n"
            "\n"
-           "  fcctl [--config|-c <host.json>] --run <vm.json>\n"
-           "  fcctl [--config|-c <host.json>] --stop <vm.json>\n"
-           "  fcctl [--config|-c <host.json>] --clean <vm.json>\n"
-           "  fcctl [--config|-c <host.json>] --prepare <vm.json>\n"
-           "  fcctl [--config|-c <host.json>] --check [vm.json]\n"
-           "  fcctl [--config|-c <host.json>] --generate <vm|--all> [--write]\n"
+           "  fcctl --config <host.json> --run <vm.json>\n"
+           "  fcctl --config <host.json> --stop <vm.json>\n"
+           "  fcctl --config <host.json> --clean <vm.json>\n"
+           "  fcctl --config <host.json> --prepare <vm.json>\n"
+           "  fcctl --config <host.json> --check [vm.json]\n"
+           "  fcctl --config <host.json> --generate <vm|--all> [--write]\n"
            "\n"
-           "VM files are Firecracker JSON in /etc/fcctl (config.json is the host file).\n"
-           "Host network[] creates tap/bridge/macvtap/macvlan devices; no addresses or NAT.\n"
-           "Subcommands (run, stop, clean, prepare, check, generate) are aliases for the flags.\n";
+           "--config / -c is the host profile (Firecracker binary, TAP type, bridge).\n"
+           "--run (and --stop/--clean/...) take the VM's Firecracker JSON.\n"
+           "The same VM file can be started under different host profiles.\n"
+           "run, stop, clean, prepare, check, generate are aliases for those action flags.\n";
 }
 
 std::string action_token(const std::string& arg) {
@@ -1588,6 +1599,13 @@ void self_test() {
         unit.find("RequiresMountsFor=/etc/fcctl/boot/vmlinux-exp\n") == std::string::npos ||
         unit.find("RestartPreventExitStatus=69\n") == std::string::npos) {
         fail("unit text mismatch:\n" + unit);
+    }
+    Host profile = host;
+    profile.config_path = "/etc/fcctl/config2.json";
+    const std::string alt = render_unit(profile, debian);
+    if (alt.find("--config \"/etc/fcctl/config2.json\" --run \"/etc/fcctl/debian.json\"") ==
+        std::string::npos) {
+        fail("unit should bake the chosen host profile into --config:\n" + alt);
     }
     const Host bridged = host_from_text(R"({
         "network": [{ "type": "bridge", "master": "brg27" }]
