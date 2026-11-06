@@ -36,7 +36,7 @@ struct ExitCode : std::runtime_error {
 
 namespace {
 
-constexpr const char* kVersion = "0.2.1";
+constexpr const char* kVersion = "0.2.2";
 
 struct Disk {
     std::string path;
@@ -1097,6 +1097,12 @@ std::vector<std::string> prepare_nics(const Host& host, const Vm& vm) {
         for (const Nic& nic : vm.nics) {
             const NetSpec spec = spec_for_nic(host, nic.host_dev);
             const bool existed = iface_exists(nic.host_dev);
+            // Firecracker opens an existing macvtap by name and uses guest_mac
+            // as the virtio address, so the host device must carry that MAC.
+            if (spec.type == "macvtap" && nic.mac.empty()) {
+                fail("macvtap '" + nic.host_dev +
+                     "' requires guest_mac; it is copied onto the host device");
+            }
             if (!existed) {
                 if (spec.type == "macvlan") {
                     create_macvlan(nic.host_dev, spec.master, spec.mode);
@@ -1106,6 +1112,11 @@ std::vector<std::string> prepare_nics(const Host& host, const Vm& vm) {
                     create_tap(nic.host_dev);
                 }
                 created.push_back(nic.host_dev);
+            } else if (spec.type == "macvtap" && !is_macvtap(nic.host_dev)) {
+                fail("interface '" + nic.host_dev + "' exists but is not a macvtap device");
+            }
+            if (spec.type == "macvtap") {
+                prepare_macvtap(nic.host_dev, nic.mac);
             }
             if (spec.type == "bridge") {
                 set_master(nic.host_dev, spec.master);
@@ -1117,6 +1128,9 @@ std::vector<std::string> prepare_nics(const Host& host, const Vm& vm) {
             }
             if (!spec.mode.empty()) {
                 line += " mode=" + spec.mode;
+            }
+            if (spec.type == "macvtap") {
+                line += " mac=" + nic.mac;
             }
             info(line);
         }
@@ -1632,6 +1646,21 @@ void self_test() {
     const Host empty_net = host_from_text(R"({"network": []})");
     if (!empty_net.network.empty() || spec_for_nic(empty_net, "fc-debian").type != "tap") {
         fail("empty network[] should create plain taps");
+    }
+    const Host macvtap = host_from_text(R"({
+        "network": [{ "type": "macvtap", "master": "eth0" }]
+    })");
+    if (macvtap.network.size() != 1 || macvtap.network[0].type != "macvtap" ||
+        macvtap.network[0].master != "eth0" || macvtap.network[0].mode != "bridge") {
+        fail("macvtap network entry did not default mode to bridge");
+    }
+    try {
+        prepare_macvtap("fcctl-no-such", "not-a-mac");
+        fail("bad MAC was accepted");
+    } catch (const std::runtime_error& err) {
+        if (std::string(err.what()).find("must look like") == std::string::npos) {
+            fail(std::string("unexpected MAC error: ") + err.what());
+        }
     }
     expect_host_fail(R"({"network": [{ "type": "tap", "master": "brg27" }]})",
                      "tap does not take master");

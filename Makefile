@@ -19,6 +19,7 @@ $(BIN): $(SRCS) src/json.hpp src/net.hpp
 test: $(BIN)
 	./$(BIN) self-test
 	tests/check.sh $(BIN)
+	tests/macvtap.sh $(BIN)
 
 # Alpine's g++ targets musl. -static produces a musl static binary.
 static:

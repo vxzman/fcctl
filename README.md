@@ -57,10 +57,18 @@
 | :--- | :--- | :--- |
 | `tap` | 持久 TAP | 能 |
 | `bridge` | 持久 TAP，再挂到 `master` | 能 |
-| `macvtap` | kind=`macvtap`，父口=`master` | 不保证。FC 走 TUNSETIFF，不是 `/dev/tapN` |
+| `macvtap` | kind=`macvtap`，父口=`master`，MAC 写成 `guest_mac` | 能。打开已有的 `/dev/tap<ifindex>`，不创建、不删除这块设备 |
 | `macvlan` | kind=`macvlan`，父口=`master` | 不能当 TAP 打开 |
 
 `macvlan` / `macvtap` 可写 `mode`：`bridge`（默认）、`vepa`、`private`、`passthru`。空数组 `network: []` 只建 TAP，不挂桥。旧键 `"bridge": "brg27"` 在没有 `network` 时仍可用。两个键一起写会报错。
+
+macvtap 的总配置示例：
+
+```json
+{ "type": "macvtap", "master": "eth0", "mode": "bridge" }
+```
+
+这块虚拟机网卡必须带 `guest_mac`。fcctl 把该地址写到 macvtap 上，再确认本进程能打开 `/dev/tap<ifindex>`（权限不够时把节点改成当前用户的 `0600`）。Firecracker 按 `host_dev_name` 打开这个已有设备。父口要已经存在。同名接口若已在且不是 macvtap，准备失败，不会改它的类型。`--clean` 和进程退出只删这块 macvtap，不删父口。macvtap 没有 hairpin，主机通常不能经父口访问客户机。fcctl 直接 exec Firecracker，不走 jailer。二进制需要会按接口名打开 macvtap；只走 `/dev/net/tun` + `TUNSETIFF` 的上游版本打不开。
 
 fcctl 只创建并拉起接口，不配 IP、不做 NAT、不写 nft/iptables。
 
@@ -68,7 +76,7 @@ fcctl 只创建并拉起接口，不配 IP、不做 NAT、不写 nft/iptables。
 
 可用环境变量覆盖：`FCCTL_CONFIG`、`FCCTL_CONFIG_DIR`、`FCCTL_BRIDGE`、`FCCTL_RUNTIME`、`FCCTL_FIRECRACKER`、`FCCTL_BIN`。`FCCTL_BRIDGE` 覆盖默认（未命名）bridge 条目的 `master`。
 
-虚拟机 JSON 里网卡名和 MAC 来自 `network-interfaces[].host_dev_name` 和 `guest_mac`，磁盘来自 `drives[].path_on_host`。Firecracker 打开 TAP；vsock 不是 TAP，fcctl 不管。
+虚拟机 JSON 里网卡名和 MAC 来自 `network-interfaces[].host_dev_name` 和 `guest_mac`，磁盘来自 `drives[].path_on_host`。tap / bridge 由 Firecracker 打开 TAP。macvtap 时 `guest_mac` 同时是主机设备地址。vsock 不是 TAP，fcctl 不管。
 
 ## 命令
 

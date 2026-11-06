@@ -13,7 +13,9 @@
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include <vector>
 
@@ -25,6 +27,7 @@ constexpr std::uint16_t kNlmFRequest = 0x01;
 constexpr std::uint16_t kNlmFAck = 0x04;
 constexpr std::uint16_t kNlmsgError = 2;
 constexpr std::size_t kNlmsgHdrlen = 16;
+constexpr std::uint16_t kIflaAddress = 1;
 constexpr std::uint16_t kIflaIfname = 3;
 constexpr std::uint16_t kIflaLink = 5;
 constexpr std::uint16_t kIflaMaster = 10;
@@ -239,6 +242,51 @@ private:
     int fd_ = -1;
 };
 
+int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+// Six colon-separated hex octets, the same shape as guest_mac.
+void parse_mac(const std::string& mac, unsigned char out[6]) {
+    if (mac.size() != 17) {
+        throw std::runtime_error("MAC address '" + mac + "' must look like 0a:fc:00:00:02:00");
+    }
+    for (int i = 0; i < 6; ++i) {
+        const std::size_t at = static_cast<std::size_t>(i) * 3;
+        if (i > 0 && mac[at - 1] != ':') {
+            throw std::runtime_error("MAC address '" + mac + "' must look like 0a:fc:00:00:02:00");
+        }
+        const int hi = hex_nibble(mac[at]);
+        const int lo = hex_nibble(mac[at + 1]);
+        if (hi < 0 || lo < 0) {
+            throw std::runtime_error("MAC address '" + mac + "' must look like 0a:fc:00:00:02:00");
+        }
+        out[i] = static_cast<unsigned char>((hi << 4) | lo);
+    }
+}
+
+bool wait_for_char_device(const std::string& path) {
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        struct stat st {};
+        if (::stat(path.c_str(), &st) == 0 && S_ISCHR(st.st_mode)) {
+            return true;
+        }
+        timespec pause{};
+        pause.tv_nsec = 50L * 1000L * 1000L;
+        ::nanosleep(&pause, nullptr);
+    }
+    return false;
+}
+
 int ifindex_of(const std::string& name) {
     const std::string path = "/sys/class/net/" + name + "/ifindex";
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -272,6 +320,18 @@ void fill_ifr_name(ifreq& req, const std::string& name) {
 bool iface_exists(const std::string& name) {
     const std::string path = "/sys/class/net/" + name;
     return ::access(path.c_str(), F_OK) == 0;
+}
+
+bool is_macvtap(const std::string& name) {
+    if (!iface_exists(name)) {
+        return false;
+    }
+    try {
+        const std::string path = "/sys/class/macvtap/tap" + std::to_string(ifindex_of(name));
+        return ::access(path.c_str(), F_OK) == 0;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 void create_tap(const std::string& name) {
@@ -368,6 +428,38 @@ void set_up(const std::string& name) {
     } catch (const std::runtime_error& err) {
         throw std::runtime_error("failed to bring up interface '" + name + "': " + err.what());
     }
+}
+
+void prepare_macvtap(const std::string& name, const std::string& mac) {
+    unsigned char addr[6];
+    parse_mac(mac, addr);
+    const int index = ifindex_of(name);
+    Msg msg(kRtmNewlink, kNlmFRequest | kNlmFAck, next_seq());
+    msg.ifinfo(index, 0, 0);
+    msg.attr(kIflaAddress, addr, sizeof(addr));
+    try {
+        Netlink().talk(msg.finish());
+    } catch (const std::runtime_error& err) {
+        throw std::runtime_error("failed to set MAC address of '" + name + "' to '" + mac +
+                                 "': " + err.what());
+    }
+
+    const std::string path = "/dev/tap" + std::to_string(index);
+    if (!wait_for_char_device(path)) {
+        throw std::runtime_error("macvtap '" + name + "' has no device node " + path);
+    }
+    int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0 && (errno == EACCES || errno == EPERM)) {
+        if (::chown(path.c_str(), ::geteuid(), ::getegid()) != 0 ||
+            ::chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0) {
+            throw std::runtime_error("cannot make " + path + " openable: " + std::strerror(errno));
+        }
+        fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    }
+    if (fd < 0) {
+        throw std::runtime_error("cannot open macvtap node " + path + ": " + std::strerror(errno));
+    }
+    ::close(fd);
 }
 
 void delete_link(const std::string& name) {
