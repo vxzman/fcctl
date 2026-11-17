@@ -8,6 +8,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +70,8 @@ struct Host {
     std::string config_path = "/etc/fcctl/config.json";
     std::vector<NetSpec> network;
     std::string binary;
+    // Secondary VM directory. /usr/local/etc/fcctl is always searched first
+    // unless FCCTL_CONFIG_DIR replaces the list for one invocation.
     std::string config_dir = "/etc/fcctl";
     std::string runtime_dir = "/run/firecracker";
     std::string fcctl_bin = "/usr/local/bin/fcctl";
@@ -391,6 +394,8 @@ Host load_host(const std::string& cli_config) {
     } else if (const char* env = std::getenv("FCCTL_CONFIG")) {
         host.config_path = env;
         explicit_config = true;
+    } else if (is_file("/usr/local/etc/fcctl/config.json")) {
+        host.config_path = "/usr/local/etc/fcctl/config.json";
     }
     if (is_file(host.config_path)) {
         apply_host_json(host, parse_json(read_file(host.config_path)), host.config_path);
@@ -407,6 +412,46 @@ Host load_host(const std::string& cli_config) {
     host.runtime_dir = env_or("FCCTL_RUNTIME", host.runtime_dir);
     host.binary = env_or("FCCTL_FIRECRACKER", host.binary);
     return host;
+}
+
+// FCCTL_CONFIG_DIR names one directory and nothing else, so a check against a
+// temporary tree does not also read the host directories. Otherwise
+// /usr/local/etc/fcctl is first and config_dir (default /etc/fcctl) is next.
+std::vector<std::string> vm_dirs(const Host& host) {
+    if (const char* env = std::getenv("FCCTL_CONFIG_DIR")) {
+        if (*env != '\0') {
+            return {env};
+        }
+    }
+    std::vector<std::string> dirs;
+    auto add = [&](const std::string& dir) {
+        if (!dir.empty() && std::find(dirs.begin(), dirs.end(), dir) == dirs.end()) {
+            dirs.push_back(dir);
+        }
+    };
+    add("/usr/local/etc/fcctl");
+    add(host.config_dir);
+    return dirs;
+}
+
+std::string join_dirs(const std::vector<std::string>& dirs) {
+    std::string out;
+    for (std::size_t i = 0; i < dirs.size(); ++i) {
+        if (i != 0) {
+            out += ", ";
+        }
+        out += dirs[i];
+    }
+    return out;
+}
+
+bool any_dir(const std::vector<std::string>& dirs) {
+    for (const std::string& dir : dirs) {
+        if (is_dir(dir)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 NetSpec spec_for_nic(const Host& host, const std::string& ifname) {
@@ -570,6 +615,31 @@ void load_dir(const std::string& dir, std::vector<Vm>& vms, Report& report) {
     }
 }
 
+// Earlier directories win. A later file with the same VM name is hidden.
+// Two files in one directory are left for check_vms to report as duplicates.
+void load_dirs(const std::vector<std::string>& dirs, std::vector<Vm>& vms, Report& report) {
+    std::set<std::string> seen;
+    for (const std::string& dir : dirs) {
+        std::vector<Vm> batch;
+        Report part;
+        load_dir(dir, batch, part);
+        report.errors.insert(report.errors.end(), part.errors.begin(), part.errors.end());
+        report.warnings.insert(report.warnings.end(), part.warnings.begin(), part.warnings.end());
+        report.bad_vms.insert(part.bad_vms.begin(), part.bad_vms.end());
+        std::set<std::string> in_dir;
+        for (Vm& vm : batch) {
+            if (seen.count(vm.name) != 0) {
+                report.warnings.push_back("VM '" + vm.name + "' in '" + vm.file +
+                                          "' is hidden by a higher-priority config");
+                continue;
+            }
+            in_dir.insert(vm.name);
+            vms.push_back(std::move(vm));
+        }
+        seen.insert(in_dir.begin(), in_dir.end());
+    }
+}
+
 Report check_vms(const std::vector<Vm>& vms) {
     Report report;
     std::set<std::string> names;
@@ -707,7 +777,7 @@ Report check_vms(const std::vector<Vm>& vms) {
 Report scan(const Host& host, const std::vector<std::string>& extra) {
     std::vector<Vm> vms;
     Report load_errors;
-    load_dir(host.config_dir, vms, load_errors);
+    load_dirs(vm_dirs(host), vms, load_errors);
     std::set<std::string> seen;
     for (const Vm& vm : vms) {
         seen.insert(real_path_or_literal(vm.file));
@@ -1374,14 +1444,15 @@ void cmd_generate_one(const Host& host, const Vm& vm, bool write) {
 }
 
 void cmd_generate_all(const Host& host, bool write) {
-    if (!is_dir(host.config_dir)) {
-        fail("VM directory '" + host.config_dir + "' does not exist");
+    const std::vector<std::string> dirs = vm_dirs(host);
+    if (!any_dir(dirs)) {
+        fail("VM directory does not exist: " + join_dirs(dirs));
     }
     const Report report = scan(host, {});
     print_report(report);
     std::vector<Vm> vms;
     Report ignored;
-    load_dir(host.config_dir, vms, ignored);
+    load_dirs(dirs, vms, ignored);
     int wrote = 0;
     for (Vm vm : vms) {
         if (report.bad_vms.count(vm.name) != 0) {
@@ -1406,15 +1477,16 @@ void cmd_generate_all(const Host& host, bool write) {
 }
 
 int cmd_generator(const Host& host, const std::string& out_dir) {
-    if (!is_dir(host.config_dir)) {
-        warn("VM directory '" + host.config_dir + "' does not exist");
+    const std::vector<std::string> dirs = vm_dirs(host);
+    if (!any_dir(dirs)) {
+        warn("VM directory does not exist: " + join_dirs(dirs));
         return 0;
     }
     const Report report = scan(host, {});
     print_report(report);
     std::vector<Vm> vms;
     Report ignored;
-    load_dir(host.config_dir, vms, ignored);
+    load_dirs(dirs, vms, ignored);
     for (Vm vm : vms) {
         if (report.bad_vms.count(vm.name) != 0) {
             std::cerr << "[fcctl-generator] skipping conflicting VM '" << vm.name << "'\n";
@@ -1430,9 +1502,11 @@ Vm vm_from_arg(const std::string& target, const Host& host) {
     if (is_file(target)) {
         return parse_vm(target);
     }
-    const std::string in_dir = host.config_dir + "/" + target + ".json";
-    if (is_file(in_dir)) {
-        return parse_vm(in_dir);
+    for (const std::string& dir : vm_dirs(host)) {
+        const std::string in_dir = dir + "/" + target + ".json";
+        if (is_file(in_dir)) {
+            return parse_vm(in_dir);
+        }
     }
     const std::string with_suffix = target + ".json";
     if (is_file(with_suffix)) {
@@ -1454,6 +1528,9 @@ void usage() {
            "  fcctl --config <host.json> --generate <vm|--all> [--write]\n"
            "\n"
            "--config / -c is the host profile (Firecracker binary, TAP type, bridge).\n"
+           "Host config is /usr/local/etc/fcctl/config.json when that file exists,\n"
+           "otherwise /etc/fcctl/config.json. VM JSON is searched in\n"
+           "/usr/local/etc/fcctl first, then config_dir (default /etc/fcctl).\n"
            "--run (and --stop/--clean/...) take the VM's Firecracker JSON.\n"
            "The same VM file can be started under different host profiles.\n"
            "run, stop, clean, prepare, check, generate are aliases for those action flags.\n";
@@ -1570,7 +1647,82 @@ void expect_host_fail(const std::string& text, const std::string& needle) {
     }
 }
 
+void test_vm_search_order() {
+    const char* saved = std::getenv("FCCTL_CONFIG_DIR");
+    const std::string saved_copy = saved == nullptr ? "" : saved;
+    ::unsetenv("FCCTL_CONFIG_DIR");
+    Host host;
+    std::vector<std::string> dirs = vm_dirs(host);
+    if (dirs.size() != 2 || dirs[0] != "/usr/local/etc/fcctl" || dirs[1] != "/etc/fcctl") {
+        fail("default VM search order is wrong");
+    }
+    host.config_dir = "/usr/local/etc/fcctl";
+    dirs = vm_dirs(host);
+    if (dirs.size() != 1 || dirs[0] != "/usr/local/etc/fcctl") {
+        fail("local etc directory was listed twice");
+    }
+    ::setenv("FCCTL_CONFIG_DIR", "/tmp/fcctl-only", 1);
+    host.config_dir = "/etc/fcctl";
+    dirs = vm_dirs(host);
+    if (dirs.size() != 1 || dirs[0] != "/tmp/fcctl-only") {
+        fail("FCCTL_CONFIG_DIR should replace the search list");
+    }
+    if (saved_copy.empty()) {
+        ::unsetenv("FCCTL_CONFIG_DIR");
+    } else {
+        ::setenv("FCCTL_CONFIG_DIR", saved_copy.c_str(), 1);
+    }
+
+    char high[] = "/tmp/fcctl-high-XXXXXX";
+    char low[] = "/tmp/fcctl-low-XXXXXX";
+    if (::mkdtemp(high) == nullptr || ::mkdtemp(low) == nullptr) {
+        fail(std::string("mkdtemp: ") + std::strerror(errno));
+    }
+    const std::string vm =
+        R"({"boot-source":{"kernel_image_path":"/k"},"machine-config":{"vcpu_count":1,"mem_size_mib":128}})";
+    auto write_text = [](const std::string& path, const std::string& text) {
+        std::ofstream out(path);
+        if (!out) {
+            fail("cannot write '" + path + "'");
+        }
+        out << text;
+    };
+    write_text(std::string(high) + "/debian.json", vm);
+    write_text(std::string(low) + "/debian.json", vm);
+    write_text(std::string(low) + "/rocky.json", vm);
+    std::vector<Vm> vms;
+    Report report;
+    load_dirs({high, low}, vms, report);
+    bool saw_debian = false;
+    bool saw_rocky = false;
+    for (const Vm& item : vms) {
+        if (item.name == "debian") {
+            saw_debian = item.file.rfind(high, 0) == 0;
+        } else if (item.name == "rocky") {
+            saw_rocky = true;
+        }
+    }
+    ::unlink((std::string(high) + "/debian.json").c_str());
+    ::unlink((std::string(low) + "/debian.json").c_str());
+    ::unlink((std::string(low) + "/rocky.json").c_str());
+    ::rmdir(high);
+    ::rmdir(low);
+    if (!saw_debian || !saw_rocky) {
+        fail("higher-priority VM directory did not win");
+    }
+    bool warned = false;
+    for (const std::string& message : report.warnings) {
+        if (message.find("hidden by") != std::string::npos) {
+            warned = true;
+        }
+    }
+    if (!warned) {
+        fail("shadowed VM produced no warning");
+    }
+}
+
 void self_test() {
+    test_vm_search_order();
     const Json sample = parse_json(R"({
         "boot-source": {"kernel_image_path": "/k", "boot_args": "console=ttyS0"},
         "drives": [{
@@ -1704,7 +1856,8 @@ int cmd_check(const Host& host, const std::string& target) {
     if (!target.empty()) {
         extra.push_back(target);
     }
-    if (!extra.empty() || is_dir(host.config_dir)) {
+    const std::vector<std::string> dirs = vm_dirs(host);
+    if (!extra.empty() || any_dir(dirs)) {
         const Report report = scan(host, extra);
         print_report(report);
         if (!report.errors.empty()) {
@@ -1713,15 +1866,13 @@ int cmd_check(const Host& host, const std::string& target) {
         info(std::to_string([&] {
                  std::vector<Vm> vms;
                  Report ignored;
-                 if (is_dir(host.config_dir)) {
-                     load_dir(host.config_dir, vms, ignored);
-                 }
+                 load_dirs(dirs, vms, ignored);
                  return vms.size();
              }()) +
              " VM config(s) checked");
         return 0;
     }
-    fail("VM directory '" + host.config_dir + "' does not exist");
+    fail("VM directory does not exist: " + join_dirs(dirs));
 }
 
 }  // namespace

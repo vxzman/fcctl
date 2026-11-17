@@ -29,7 +29,7 @@
 
 ## 总配置
 
-总配置在 `--config` 指向的 JSON 里。目录里可以放多份（`config1.json`、`config2.json` …）。扫描虚拟机时会跳过这些主机文件。默认路径是 `/etc/fcctl/config.json`。
+总配置在 `--config` 指向的 JSON 里。目录里可以放多份（`config1.json`、`config2.json` …）。扫描虚拟机时会跳过这些主机文件。未指定 `--config` 和 `FCCTL_CONFIG` 时，先用 `/usr/local/etc/fcctl/config.json`，没有这个文件再用 `/etc/fcctl/config.json`。虚拟机 JSON 先搜 `/usr/local/etc/fcctl`，再搜总配置里的 `config_dir`（默认 `/etc/fcctl`）。同名虚拟机用前面目录里的那一份。`FCCTL_CONFIG_DIR` 仍只扫这一个目录。
 
 ```json
 {
@@ -114,7 +114,7 @@ RestartSec=2
 
 `/dev/` 上的磁盘会写成 systemd device 依赖。串口仍是 Firecracker 的标准输入输出；单元把标准输入设为空，输出进 journal。客户机里 `reboot` 和 `poweroff` 在 Firecracker 1.16 及以上都是进程退出码 0，单元不会把这种退出当成失败再拉起。
 
-安装后把 `fcctl` 链接为 `/etc/systemd/system-generators/fcctl-generator`。`systemctl daemon-reload` 会为 `/etc/fcctl` 里的虚拟机 JSON 生成单元，并跳过总配置文件。有冲突的虚拟机会被跳过。
+安装后把 `fcctl` 链接为 `/etc/systemd/system-generators/fcctl-generator`。`systemctl daemon-reload` 会为 `/usr/local/etc/fcctl` 和 `config_dir` 里的虚拟机 JSON 生成单元，并跳过总配置文件。同名时用 `/usr/local/etc/fcctl` 里的那一份。有冲突的虚拟机会被跳过。
 
 ## 编译与安装
 
