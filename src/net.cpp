@@ -23,9 +23,12 @@ namespace {
 
 constexpr std::uint16_t kRtmNewlink = 16;
 constexpr std::uint16_t kRtmDellink = 17;
+constexpr std::uint16_t kRtmGetlink = 18;
 constexpr std::uint16_t kNlmFRequest = 0x01;
 constexpr std::uint16_t kNlmFAck = 0x04;
 constexpr std::uint16_t kNlmsgError = 2;
+constexpr std::uint16_t kNlmsgDone = 3;
+constexpr std::uint16_t kNlaTypeMask = 0x3fff;
 constexpr std::size_t kNlmsgHdrlen = 16;
 constexpr std::uint16_t kIflaAddress = 1;
 constexpr std::uint16_t kIflaIfname = 3;
@@ -154,29 +157,44 @@ std::vector<std::uint8_t> c_string(const std::string& text) {
     return bytes;
 }
 
-// Some(result) ends the read. Empty means this datagram had no ACK.
-bool parse_ack(const std::uint8_t* buf, std::size_t len, int& err_out) {
-    std::size_t off = 0;
-    while (off + kNlmsgHdrlen <= len) {
+// Pull RTM_NEWLINK messages out of one datagram. An ACK sets saw_ack.
+// Messages whose sequence does not match the request are ignored.
+void collect_replies(const std::uint8_t* buf, std::size_t len, std::uint32_t seq, int& err_out,
+                     bool& saw_ack, std::vector<std::vector<std::uint8_t>>& out) {
+    std::size_t remain = len;
+    const std::uint8_t* cur = buf;
+    while (remain >= kNlmsgHdrlen) {
         std::uint32_t nlen = 0;
-        std::memcpy(&nlen, buf + off, 4);
-        if (nlen < kNlmsgHdrlen || off + nlen > len) {
+        std::memcpy(&nlen, cur, 4);
+        if (nlen < kNlmsgHdrlen || nlen > remain) {
             break;
         }
         std::uint16_t kind = 0;
-        std::memcpy(&kind, buf + off + 4, 2);
-        if (kind == kNlmsgError) {
-            if (nlen < kNlmsgHdrlen + 4) {
-                throw std::runtime_error("short netlink error message");
+        std::memcpy(&kind, cur + 4, 2);
+        std::uint32_t msg_seq = 0;
+        std::memcpy(&msg_seq, cur + 8, 4);
+        if (msg_seq == seq) {
+            if (kind == kNlmsgError) {
+                if (nlen < kNlmsgHdrlen + 4) {
+                    throw std::runtime_error("short netlink error message");
+                }
+                std::int32_t err = 0;
+                std::memcpy(&err, cur + kNlmsgHdrlen, 4);
+                err_out = err;
+                saw_ack = true;
+            } else if (kind == kRtmNewlink) {
+                out.emplace_back(cur, cur + nlen);
+            } else if (kind == kNlmsgDone) {
+                saw_ack = true;
             }
-            std::int32_t err = 0;
-            std::memcpy(&err, buf + off + 16, 4);
-            err_out = err;
-            return true;
         }
-        off += (nlen + 3) & ~std::size_t{3};
+        const std::size_t step = (static_cast<std::size_t>(nlen) + 3) & ~std::size_t{3};
+        if (step < kNlmsgHdrlen || step > remain) {
+            break;
+        }
+        cur += step;
+        remain -= step;
     }
-    return false;
 }
 
 class Netlink {
@@ -209,34 +227,61 @@ public:
 
     ~Netlink() { ::close(fd_); }
 
-    void talk(const std::vector<std::uint8_t>& msg) {
+    // Datagrams are kept until the ACK. A reply larger than the buffer is
+    // received whole; GETLINK carries more attributes than an ACK.
+    std::vector<std::vector<std::uint8_t>> roundtrip(const std::vector<std::uint8_t>& msg) {
         sockaddr_nl dest{};
         dest.nl_family = AF_NETLINK;
         if (::sendto(fd_, msg.data(), msg.size(), 0, reinterpret_cast<sockaddr*>(&dest),
                      sizeof(dest)) < 0) {
             io_error("failed to send a netlink message");
         }
-        std::uint8_t buf[8192];
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            const ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+        std::uint32_t seq = 0;
+        if (msg.size() >= 12) {
+            std::memcpy(&seq, msg.data() + 8, 4);
+        }
+        std::vector<std::vector<std::uint8_t>> replies;
+        std::vector<std::uint8_t> buf(8192);
+        int spins = 0;
+        while (spins < 32) {
+            const ssize_t peeked = ::recv(fd_, buf.data(), buf.size(), MSG_PEEK | MSG_TRUNC);
+            if (peeked < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                io_error("failed to read a netlink reply");
+            }
+            if (static_cast<std::size_t>(peeked) > buf.size()) {
+                buf.resize(static_cast<std::size_t>(peeked));
+                continue;
+            }
+            const ssize_t n = ::recv(fd_, buf.data(), buf.size(), 0);
             if (n < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
                 io_error("failed to read a netlink reply");
             }
+            ++spins;
+            if (n == 0) {
+                continue;
+            }
             int err = 0;
-            if (!parse_ack(buf, static_cast<std::size_t>(n), err)) {
+            bool saw_ack = false;
+            collect_replies(buf.data(), static_cast<std::size_t>(n), seq, err, saw_ack, replies);
+            if (!saw_ack) {
                 continue;
             }
             if (err == 0) {
-                return;
+                return replies;
             }
             errno = -err;
             throw NlError(errno, std::string("netlink: ") + std::strerror(errno));
         }
         throw std::runtime_error("netlink reply did not include an acknowledgement");
     }
+
+    void talk(const std::vector<std::uint8_t>& msg) { roundtrip(msg); }
 
 private:
     int fd_ = -1;
@@ -315,6 +360,74 @@ void fill_ifr_name(ifreq& req, const std::string& name) {
     std::memcpy(req.ifr_name, name.data(), name.size());
 }
 
+template <typename Fn>
+void for_each_nla(const std::uint8_t* data, std::size_t len, Fn fn) {
+    std::size_t off = 0;
+    while (off + 4 <= len) {
+        std::uint16_t nlen = 0;
+        std::uint16_t ntype = 0;
+        std::memcpy(&nlen, data + off, 2);
+        std::memcpy(&ntype, data + off + 2, 2);
+        if (nlen < 4 || static_cast<std::size_t>(nlen) > len - off) {
+            break;
+        }
+        fn(static_cast<std::uint16_t>(ntype & kNlaTypeMask), data + off + 4,
+           static_cast<std::size_t>(nlen - 4));
+        const std::size_t step = (static_cast<std::size_t>(nlen) + 3) & ~std::size_t{3};
+        if (step < 4 || step > len - off) {
+            break;
+        }
+        off += step;
+    }
+}
+
+std::string nla_string(const std::uint8_t* data, std::size_t len) {
+    while (len > 0 && data[len - 1] == 0) {
+        --len;
+    }
+    return std::string(reinterpret_cast<const char*>(data), len);
+}
+
+// Kind string inside one RTM_NEWLINK. Empty when the device has no IFLA_INFO_KIND
+// (a bridge or a physical NIC) or the buffer is not a NEWLINK.
+std::string kind_in_newlink(const std::uint8_t* data, std::size_t len) {
+    if (data == nullptr || len < kNlmsgHdrlen + 16) {
+        return {};
+    }
+    std::uint16_t kind = 0;
+    std::memcpy(&kind, data + 4, 2);
+    if (kind != kRtmNewlink) {
+        return {};
+    }
+    std::string found;
+    for_each_nla(data + 32, len - 32,
+                 [&](std::uint16_t type, const std::uint8_t* payload, std::size_t n) {
+                     if (type != kIflaLinkinfo) {
+                         return;
+                     }
+                     for_each_nla(payload, n,
+                                  [&](std::uint16_t inner, const std::uint8_t* ip, std::size_t in) {
+                                      if (inner == kIflaInfoKind) {
+                                          found = nla_string(ip, in);
+                                      }
+                                  });
+                 });
+    return found;
+}
+
+std::string link_kind(const std::string& name) {
+    Msg msg(kRtmGetlink, kNlmFRequest | kNlmFAck, next_seq());
+    msg.ifinfo(ifindex_of(name), 0, 0);
+    const std::vector<std::vector<std::uint8_t>> replies = Netlink().roundtrip(msg.finish());
+    for (const std::vector<std::uint8_t>& reply : replies) {
+        const std::string kind = kind_in_newlink(reply.data(), reply.size());
+        if (!kind.empty()) {
+            return kind;
+        }
+    }
+    return {};
+}
+
 }  // namespace
 
 bool iface_exists(const std::string& name) {
@@ -329,6 +442,22 @@ bool is_macvtap(const std::string& name) {
     try {
         const std::string path = "/sys/class/macvtap/tap" + std::to_string(ifindex_of(name));
         return ::access(path.c_str(), F_OK) == 0;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+bool is_tap(const std::string& name) {
+    const std::string path = "/sys/class/net/" + name + "/tun_flags";
+    return ::access(path.c_str(), F_OK) == 0;
+}
+
+bool is_macvlan(const std::string& name) {
+    if (!iface_exists(name)) {
+        return false;
+    }
+    try {
+        return link_kind(name) == "macvlan";
     } catch (const std::exception&) {
         return false;
     }
@@ -478,4 +607,61 @@ void delete_link(const std::string& name) {
         }
         throw std::runtime_error("failed to delete interface '" + name + "': " + err.what());
     }
+}
+
+namespace {
+
+void put_u16(std::vector<std::uint8_t>& buf, std::size_t at, std::uint16_t value) {
+    std::memcpy(buf.data() + at, &value, 2);
+}
+
+void put_u32(std::vector<std::uint8_t>& buf, std::size_t at, std::uint32_t value) {
+    std::memcpy(buf.data() + at, &value, 4);
+}
+
+void expect_kind(const std::vector<std::uint8_t>& msg, const std::string& want) {
+    const std::string got = kind_in_newlink(msg.data(), msg.size());
+    if (got != want) {
+        throw std::runtime_error("link kind parsed as '" + got + "', want '" + want + "'");
+    }
+}
+
+}  // namespace
+
+void net_self_test() {
+    // nlmsghdr + ifinfomsg, then IFLA_LINKINFO (nested flag set) / IFLA_INFO_KIND "macvlan".
+    std::vector<std::uint8_t> nested(48, 0);
+    put_u32(nested, 0, 48);
+    put_u16(nested, 4, 16);
+    put_u16(nested, 32, 16);
+    put_u16(nested, 34, static_cast<std::uint16_t>(18 | 0x8000));
+    put_u16(nested, 36, 12);
+    put_u16(nested, 38, 1);
+    std::memcpy(nested.data() + 40, "macvlan", 7);
+    expect_kind(nested, "macvlan");
+
+    // IFLA_IFNAME is 9 bytes and pads to 12. Kind follows at the aligned offset.
+    std::vector<std::uint8_t> padded(60, 0);
+    put_u32(padded, 0, 60);
+    put_u16(padded, 4, 16);
+    put_u16(padded, 32, 9);
+    put_u16(padded, 34, 3);
+    std::memcpy(padded.data() + 36, "eth0", 4);
+    put_u16(padded, 44, 16);
+    put_u16(padded, 46, 18);
+    put_u16(padded, 48, 12);
+    put_u16(padded, 50, 1);
+    std::memcpy(padded.data() + 52, "macvlan", 7);
+    expect_kind(padded, "macvlan");
+
+    std::memcpy(nested.data() + 40, "macvtap", 7);
+    expect_kind(nested, "macvtap");
+
+    std::vector<std::uint8_t> bare(32, 0);
+    put_u32(bare, 0, 32);
+    put_u16(bare, 4, 16);
+    expect_kind(bare, "");
+
+    put_u16(nested, 4, 17);
+    expect_kind(nested, "");
 }

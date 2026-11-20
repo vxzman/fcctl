@@ -1,6 +1,7 @@
 #include "json.hpp"
 #include "net.hpp"
 
+#include <signal.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1146,19 +1147,188 @@ void send_ctrl_alt_del(const std::string& path) {
     }
 }
 
-void wait_until_down(const std::string& path, int timeout_secs) {
+// /proc/net/unix columns are Num, RefCount, Protocol, Flags, Type, St, Inode, Path.
+// Inode is the 7th field. The header and a short line have no decimal inode.
+std::string inode_from_unix_line(const std::string& line) {
+    std::istringstream in(line);
+    std::string field;
+    for (int i = 0; i < 7; ++i) {
+        if (!(in >> field)) {
+            return {};
+        }
+    }
+    if (field.empty() || field.find_first_not_of("0123456789") != std::string::npos) {
+        return {};
+    }
+    return field;
+}
+
+std::string unix_path_from_line(const std::string& line) {
+    std::istringstream in(line);
+    std::string field;
+    for (int i = 0; i < 7; ++i) {
+        if (!(in >> field)) {
+            return {};
+        }
+    }
+    std::string rest;
+    if (!std::getline(in, rest)) {
+        return {};
+    }
+    const auto start = rest.find_first_not_of(" \t");
+    if (start == std::string::npos) {
+        return {};
+    }
+    std::string path = rest.substr(start);
+    while (!path.empty() && (path.back() == '\r' || path.back() == ' ' || path.back() == '\t')) {
+        path.pop_back();
+    }
+    return path;
+}
+
+std::string expected_device_kind(const std::string& type) {
+    if (type == "bridge") {
+        return "tap";
+    }
+    return type;
+}
+
+bool host_device_matches(const std::string& type, const std::string& name) {
+    if (type == "macvtap") {
+        return is_macvtap(name);
+    }
+    if (type == "macvlan") {
+        return is_macvlan(name);
+    }
+    return is_tap(name);
+}
+
+bool comm_is_firecracker(pid_t pid) {
+    std::ifstream in("/proc/" + std::to_string(pid) + "/comm");
+    std::string comm;
+    if (!std::getline(in, comm)) {
+        return false;
+    }
+    return comm.compare(0, 12, "firecracker") == 0;
+}
+
+bool process_has_fd_target(pid_t pid, const std::string& needle) {
+    const std::string dir_path = "/proc/" + std::to_string(pid) + "/fd";
+    DIR* fds = ::opendir(dir_path.c_str());
+    if (fds == nullptr) {
+        return false;
+    }
+    bool matched = false;
+    while (dirent* entry = ::readdir(fds)) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        const std::string link_path = dir_path + "/" + entry->d_name;
+        char target[80];
+        const ssize_t n = ::readlink(link_path.c_str(), target, sizeof(target) - 1);
+        if (n < 0) {
+            continue;
+        }
+        target[n] = '\0';
+        if (needle == target) {
+            matched = true;
+            break;
+        }
+    }
+    ::closedir(fds);
+    return matched;
+}
+
+std::vector<pid_t> firecracker_pids_holding_socket(const std::string& inode) {
+    std::vector<pid_t> found;
+    DIR* proc = ::opendir("/proc");
+    if (proc == nullptr) {
+        return found;
+    }
+    const std::string needle = "socket:[" + inode + "]";
+    const long self = static_cast<long>(::getpid());
+    while (dirent* entry = ::readdir(proc)) {
+        char* end = nullptr;
+        const long value = std::strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0' || value <= 1 || value == self ||
+            value > 0x7fffffffL) {
+            continue;
+        }
+        const pid_t pid = static_cast<pid_t>(value);
+        if (!comm_is_firecracker(pid)) {
+            continue;
+        }
+        if (process_has_fd_target(pid, needle)) {
+            found.push_back(pid);
+        }
+    }
+    ::closedir(proc);
+    return found;
+}
+
+std::string unix_inode_for_path(const std::string& path) {
+    std::ifstream in("/proc/net/unix");
+    if (!in) {
+        return {};
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        const std::string inode = inode_from_unix_line(line);
+        if (inode.empty()) {
+            continue;
+        }
+        if (unix_path_from_line(line) == path) {
+            return inode;
+        }
+    }
+    return {};
+}
+
+bool wait_until_down(const std::string& path, int timeout_secs) {
     const auto start = std::time(nullptr);
     while (std::time(nullptr) - start < timeout_secs) {
         if (!api_alive(path)) {
-            return;
+            return true;
         }
         timespec pause{};
-        pause.tv_nsec = 200000000;
+        pause.tv_nsec = 200000000L;
         ::nanosleep(&pause, nullptr);
     }
-    if (api_alive(path)) {
-        fail("VM is still running after " + std::to_string(timeout_secs) + "s");
+    return !api_alive(path);
+}
+
+// SendCtrlAltDel did not finish. SIGTERM the firecracker process that holds
+// the API socket, then SIGKILL if it is still accepting connections.
+bool force_stop_firecracker(const std::string& sock) {
+    const std::string inode = unix_inode_for_path(sock);
+    if (inode.empty()) {
+        warn("cannot find the inode of '" + sock + "'");
+        return !api_alive(sock);
     }
+    const std::vector<pid_t> pids = firecracker_pids_holding_socket(inode);
+    if (pids.empty()) {
+        warn("no firecracker process holds '" + sock + "'");
+        return !api_alive(sock);
+    }
+    for (pid_t pid : pids) {
+        info("sending SIGTERM to firecracker pid " + std::to_string(pid));
+        if (::kill(pid, SIGTERM) != 0 && errno != ESRCH) {
+            warn("SIGTERM failed for pid " + std::to_string(pid) + ": " + std::strerror(errno));
+        }
+    }
+    if (wait_until_down(sock, 5)) {
+        return true;
+    }
+    for (pid_t pid : pids) {
+        if (::kill(pid, 0) != 0) {
+            continue;
+        }
+        warn("firecracker pid " + std::to_string(pid) + " ignored SIGTERM; sending SIGKILL");
+        if (::kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+            warn("SIGKILL failed for pid " + std::to_string(pid) + ": " + std::strerror(errno));
+        }
+    }
+    return wait_until_down(sock, 2);
 }
 
 std::vector<std::string> prepare_nics(const Host& host, const Vm& vm) {
@@ -1173,6 +1343,10 @@ std::vector<std::string> prepare_nics(const Host& host, const Vm& vm) {
                 fail("macvtap '" + nic.host_dev +
                      "' requires guest_mac; it is copied onto the host device");
             }
+            if (existed && !host_device_matches(spec.type, nic.host_dev)) {
+                fail("interface '" + nic.host_dev + "' exists but is not a " +
+                     expected_device_kind(spec.type) + " device");
+            }
             if (!existed) {
                 if (spec.type == "macvlan") {
                     create_macvlan(nic.host_dev, spec.master, spec.mode);
@@ -1182,8 +1356,6 @@ std::vector<std::string> prepare_nics(const Host& host, const Vm& vm) {
                     create_tap(nic.host_dev);
                 }
                 created.push_back(nic.host_dev);
-            } else if (spec.type == "macvtap" && !is_macvtap(nic.host_dev)) {
-                fail("interface '" + nic.host_dev + "' exists but is not a macvtap device");
             }
             if (spec.type == "macvtap") {
                 prepare_macvtap(nic.host_dev, nic.mac);
@@ -1220,10 +1392,17 @@ std::vector<std::string> prepare_nics(const Host& host, const Vm& vm) {
 void remove_runtime(const Host& host, const Vm& vm) {
     for (const Nic& nic : vm.nics) {
         try {
-            if (iface_exists(nic.host_dev)) {
-                delete_link(nic.host_dev);
-                info("removed " + nic.host_dev);
+            if (!iface_exists(nic.host_dev)) {
+                continue;
             }
+            const NetSpec spec = spec_for_nic(host, nic.host_dev);
+            if (!host_device_matches(spec.type, nic.host_dev)) {
+                warn("leaving '" + nic.host_dev + "' in place: it is not a " +
+                     expected_device_kind(spec.type) + " device");
+                continue;
+            }
+            delete_link(nic.host_dev);
+            info("removed " + nic.host_dev);
         } catch (const std::exception& err) {
             warn(err.what());
         }
@@ -1315,7 +1494,12 @@ void cmd_stop(const Host& host, const Vm& vm) {
         return;
     }
     send_ctrl_alt_del(sock);
-    wait_until_down(sock, host.stop_timeout_secs);
+    if (!wait_until_down(sock, host.stop_timeout_secs)) {
+        warn("VM '" + vm.name + "' did not leave after SendCtrlAltDel; stopping the process");
+        if (!force_stop_firecracker(sock)) {
+            fail("VM '" + vm.name + "' is still running");
+        }
+    }
     info("VM '" + vm.name + "' stopped");
 }
 
@@ -1399,11 +1583,17 @@ void cmd_run(const Host& host, Vm vm) {
         return;
     }
     if (WIFSIGNALED(status)) {
-        const int code = 128 + WTERMSIG(status);
-        info("firecracker killed by signal " + std::to_string(WTERMSIG(status)));
+        const int sig = WTERMSIG(status);
+        info("firecracker killed by signal " + std::to_string(sig));
         guard.host = nullptr;
         remove_runtime(host, vm);
-        std::exit(code);
+        // `--stop` and Ctrl+C SIGTERM the child. Exit 0 so systemd
+        // Restart=on-failure does not start the guest again. SIGKILL stays
+        // a failure.
+        if (sig == SIGTERM) {
+            std::exit(0);
+        }
+        std::exit(128 + sig);
     }
 }
 
@@ -1848,6 +2038,21 @@ void self_test() {
         newer_bin("firecracker-v1.9.0-x86_64", "firecracker-v1.16.0-x86_64")) {
         fail("release version ordering is wrong");
     }
+    const std::string unix_line =
+        "0000000000000000: 00000003 00000000 00000000 0001 03 33002 "
+        "/run/systemd/journal/stdout";
+    if (inode_from_unix_line(unix_line) != "33002" ||
+        unix_path_from_line(unix_line) != "/run/systemd/journal/stdout") {
+        fail("unix socket line parse failed");
+    }
+    if (!inode_from_unix_line("Num       RefCount Protocol Flags    Type St Inode Path").empty() ||
+        !inode_from_unix_line("00000000: 00000001 00000000 00000000 0001 03").empty()) {
+        fail("unix socket line without an inode was accepted");
+    }
+    if (is_tap("lo") || is_macvtap("lo") || is_macvlan("lo")) {
+        fail("loopback was classified as a vm interface");
+    }
+    net_self_test();
     info("self-test ok");
 }
 

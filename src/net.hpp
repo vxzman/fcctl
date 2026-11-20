@@ -9,6 +9,12 @@
 
 bool iface_exists(const std::string& name);
 bool is_macvtap(const std::string& name);
+bool is_tap(const std::string& name);
+// IFLA_INFO_KIND == "macvlan". A query failure is false so a cleanup path
+// will not delete a device it could not identify.
+bool is_macvlan(const std::string& name);
+
+void net_self_test();
 
 // Persistent tap: IFF_TAP | IFF_NO_PI, then TUNSETPERSIST. Firecracker turns
 // on IFF_VNET_HDR itself when it opens the device.

@@ -103,4 +103,63 @@ test "$(cat "/sys/class/net/$tap/address")" = "06:00:ac:10:00:02"
 "$BIN" --config "$TMP/host.json" --clean "$TMP/vm.json"
 test ! -e "/sys/class/net/$tap"
 test -d "/sys/class/net/$parent"
+
+cat > "$TMP/host-bridge.json" << EOF
+{
+  "network": [{ "type": "bridge", "master": "$parent" }],
+  "runtime_dir": "$TMP/run",
+  "config_dir": "$TMP"
+}
+EOF
+
+"$IP" link add "$tap" type bridge
+write_vm "06:00:AC:10:00:02"
+set +e
+wrong=$("$BIN" --config "$TMP/host-bridge.json" --prepare "$TMP/vm.json" 2>&1)
+wrong_code=$?
+set -e
+echo "$wrong"
+test "$wrong_code" -ne 0
+echo "$wrong" | grep -q "is not a tap device"
+test -d "/sys/class/net/$tap"
+test ! -e "/sys/class/net/$tap/tun_flags"
+"$IP" link del "$tap"
+
+"$IP" tuntap add dev "$tap" mode tap
+idx=$(cat "/sys/class/net/$tap/ifindex")
+"$BIN" --config "$TMP/host-bridge.json" --prepare "$TMP/vm.json"
+test "$(cat "/sys/class/net/$tap/ifindex")" = "$idx"
+show=$("$IP" -o link show dev "$tap")
+echo "$show"
+echo "$show" | grep -q "master $parent"
+"$BIN" --config "$TMP/host-bridge.json" --clean "$TMP/vm.json"
+test ! -e "/sys/class/net/$tap"
+test -d "/sys/class/net/$parent"
+
+cat > "$TMP/host-macvlan.json" << EOF
+{
+  "network": [{ "type": "macvlan", "master": "$parent", "mode": "bridge" }],
+  "runtime_dir": "$TMP/run",
+  "config_dir": "$TMP"
+}
+EOF
+
+"$IP" link add "$tap" type bridge
+set +e
+not_macvlan=$("$BIN" --config "$TMP/host-macvlan.json" --prepare "$TMP/vm.json" 2>&1)
+not_macvlan_code=$?
+set -e
+echo "$not_macvlan"
+test "$not_macvlan_code" -ne 0
+echo "$not_macvlan" | grep -q "is not a macvlan device"
+test -d "/sys/class/net/$tap"
+"$IP" link del "$tap"
+
+"$IP" link add "$tap" link "$parent" type macvlan mode bridge
+idx=$(cat "/sys/class/net/$tap/ifindex")
+"$BIN" --config "$TMP/host-macvlan.json" --prepare "$TMP/vm.json"
+test "$(cat "/sys/class/net/$tap/ifindex")" = "$idx"
+"$BIN" --config "$TMP/host-macvlan.json" --clean "$TMP/vm.json"
+test ! -e "/sys/class/net/$tap"
+test -d "/sys/class/net/$parent"
 echo "macvtap.sh ok"
